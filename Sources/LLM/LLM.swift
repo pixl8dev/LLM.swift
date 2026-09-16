@@ -1058,6 +1058,10 @@ open class LLM: ObservableObject {
         var modelParams = llama_model_default_params()
         #if targetEnvironment(simulator)
         modelParams.n_gpu_layers = 0
+        #elseif os(iOS) || os(tvOS) || os(watchOS)
+        if ProcessInfo.processInfo.physicalMemory < 4_000_000_000 {
+            modelParams.n_gpu_layers = 0
+        }
         #endif
         guard let model = llama_model_load_from_file(self.path, modelParams) else {
             return nil
