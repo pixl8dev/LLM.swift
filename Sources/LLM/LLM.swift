@@ -101,6 +101,8 @@ public actor LLMCore {
     
     private var stopSequenceTokens: [Token]?
     private var tokenBuffer: [Token] = []
+    var thinkingTokenBudget = 0
+    private var lastThinkingEndTag: String?
     private let tokenDecodeCache = NSCache<NSNumber, NSString>()
     
     private var shouldContinuePredicting = false
@@ -137,6 +139,10 @@ public actor LLMCore {
         thinkingEndTokens = end
         thinkingStartMarker = startMarker
         thinkingEndMarker = endMarker
+    }
+
+    func setThinkingBudget(_ tokens: Int) {
+        thinkingTokenBudget = max(0, tokens)
     }
     
     private func recreateSampler() {
@@ -408,6 +414,7 @@ public actor LLMCore {
             var currentlyInThinkingPhase = thinkingMode == .enabled && startMarker != nil
             var shouldGuaranteeOutput = true
             var pendingText = ""
+            var thinkingTokenCount = 0
             
             func stream(_ text: String) {
                 guard !text.isEmpty else { return }
@@ -491,6 +498,18 @@ public actor LLMCore {
                     if foundThinkingEndMarker() { continue }
                 }
                 
+                if currentlyInThinkingPhase, thinkingTokenBudget > 0, let endTokens = thinkingEndTokens {
+                    thinkingTokenCount += 1
+                    if thinkingTokenCount > thinkingTokenBudget {
+                        guard injectTokensIntoContext(endTokens + [newlineToken]) else {
+                            finishAllStreams()
+                            return
+                        }
+                        transitionToResponsePhase()
+                        continue
+                    }
+                }
+                
                 streamOldestPendingTextIfNeeded()
             }
             
@@ -512,6 +531,7 @@ public actor LLMCore {
             let failure = try? JSONDecoder().decode(WrapperFailure.self, from: data)
             throw LLMError.chatTemplateFailed(failure?.error ?? "unrecognized render output")
         }
+        lastThinkingEndTag = prompt.thinkingEndTag
         return prompt
     }
 
@@ -564,13 +584,31 @@ public actor LLMCore {
             }
 
             var isFirstToken = true
+            var thinkingTokens = 0
+            var forcedThinkingEnd = false
+            var guaranteeContentToken = false
             while !isInterrupted(generation) && shouldContinuePredicting && currentTokenCount < Int32(maxTokenCount) {
-                let token = predictNextToken(excluding: isFirstToken ? [endToken] : [])
+                let token = predictNextToken(excluding: (isFirstToken || guaranteeContentToken) ? [endToken] : [])
                 isFirstToken = false
+                guaranteeContentToken = false
                 if token == endToken || token == endOfTurnToken { break }
                 rawText += decode(token, special: true)
                 if let partial = parseGeneration(rawText, isPartial: true) {
                     streamDeltas(from: partial)
+                    if !forcedThinkingEnd, thinkingTokenBudget > 0,
+                       let reasoning = partial.reasoningContent, !reasoning.isEmpty,
+                       partial.content?.isEmpty ?? true {
+                        thinkingTokens += 1
+                        if thinkingTokens > thinkingTokenBudget,
+                           let endTag = lastThinkingEndTag, !endTag.isEmpty {
+                            let endTokens = encode(endTag, shouldAddBOS: false, special: true) + [newlineToken]
+                            if injectTokensIntoContext(endTokens) {
+                                rawText += endTag
+                                forcedThinkingEnd = true
+                                guaranteeContentToken = true
+                            }
+                        }
+                    }
                 }
             }
 
@@ -719,6 +757,8 @@ public enum LLMError: Error {
 struct RenderedPrompt: Decodable {
     let prompt: String
     let additionalStops: [String]
+    let thinkingStartTag: String?
+    let thinkingEndTag: String?
 }
 
 struct WrapperFailure: Decodable {
@@ -1039,7 +1079,8 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        gpuLayers: Int32? = nil
     ) {
         LLM.silenceLogging()
         self.path = path.cString(using: .utf8)!
@@ -1059,9 +1100,8 @@ open class LLM: ObservableObject {
         #if targetEnvironment(simulator)
         modelParams.n_gpu_layers = 0
         #elseif os(iOS) || os(tvOS) || os(watchOS)
-        if ProcessInfo.processInfo.physicalMemory < 4_000_000_000 {
-            modelParams.n_gpu_layers = 0
-        }
+        let lowMemoryDevice = ProcessInfo.processInfo.physicalMemory < 4_000_000_000
+        modelParams.n_gpu_layers = gpuLayers ?? (lowMemoryDevice ? 0 : modelParams.n_gpu_layers)
         #endif
         guard let model = llama_model_load_from_file(self.path, modelParams) else {
             return nil
@@ -1105,7 +1145,8 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        gpuLayers: Int32? = nil
     ) {
         self.init(
             from: url.path,
@@ -1118,7 +1159,8 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            gpuLayers: gpuLayers
         )
     }
     
@@ -1133,7 +1175,8 @@ open class LLM: ObservableObject {
         repeatPenalty: Float = 1.2,
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        gpuLayers: Int32? = nil
     ) {
         self.init(
             from: url.path,
@@ -1146,7 +1189,8 @@ open class LLM: ObservableObject {
             repeatPenalty: repeatPenalty,
             repetitionLookback: repetitionLookback,
             historyLimit: historyLimit,
-            maxTokenCount: maxTokenCount
+            maxTokenCount: maxTokenCount,
+            gpuLayers: gpuLayers
         )
         self.preprocess = template.preprocess
         self.template = template
@@ -1165,6 +1209,7 @@ open class LLM: ObservableObject {
         repetitionLookback: Int32 = 64,
         historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048,
+        gpuLayers: Int32? = nil,
         updateProgress: @Sendable @escaping (Double) -> Void = { print(String(format: "downloaded(%.2f%%)", $0 * 100)) }
     ) async throws {
         let url = try await huggingFaceModel.download(to: url, as: name) { progress in
@@ -1182,7 +1227,8 @@ open class LLM: ObservableObject {
                 repeatPenalty: repeatPenalty,
                 repetitionLookback: repetitionLookback,
                 historyLimit: historyLimit,
-                maxTokenCount: maxTokenCount
+                maxTokenCount: maxTokenCount,
+                gpuLayers: gpuLayers
             )
             await setupThinkingTokens(from: template)
         } else {
@@ -1196,7 +1242,8 @@ open class LLM: ObservableObject {
                 repeatPenalty: repeatPenalty,
                 repetitionLookback: repetitionLookback,
                 historyLimit: historyLimit,
-                maxTokenCount: maxTokenCount
+                maxTokenCount: maxTokenCount,
+                gpuLayers: gpuLayers
             )
         }
     }
@@ -1256,11 +1303,12 @@ open class LLM: ObservableObject {
         return output
     }
     
-    public func respond(to input: String, thinking: ThinkingMode = .none, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
+    public func respond(to input: String, thinking: ThinkingMode = .none, thinkingBudget: Int = 0, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
         guard isAvailable else { return }
         
         isAvailable = false
         defer { isAvailable = true }
+        configure { await self.core.setThinkingBudget(thinkingBudget) }
         await configuration?.value
         
         self.input = input
@@ -1278,11 +1326,12 @@ open class LLM: ObservableObject {
         postprocess(output)
     }
     
-    open func respond(to input: String, thinking: ThinkingMode = .none) async {
+    open func respond(to input: String, thinking: ThinkingMode = .none, thinkingBudget: Int = 0) async {
         guard isAvailable else { return }
 
         isAvailable = false
         defer { isAvailable = true }
+        configure { await self.core.setThinkingBudget(thinkingBudget) }
         await configuration?.value
 
         self.input = input

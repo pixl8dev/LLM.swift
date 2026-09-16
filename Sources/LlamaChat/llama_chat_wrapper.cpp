@@ -57,6 +57,8 @@ char * llm_chat_render(llm_chat_session * session, const char * messagesJSON, co
         json result = {
             { "prompt", params.prompt },
             { "additionalStops", params.additional_stops },
+            { "thinkingStartTag", params.thinking_start_tag },
+            { "thinkingEndTag", params.thinking_end_tag },
         };
         return copyString(result.dump());
     } catch (const std::exception & exception) {
